@@ -9,6 +9,8 @@ export type Agent = {
   model: string;
   runtime: string;
   workspace?: string;
+  instructions?: string;
+  memoryEnabled?: boolean;
   memory: string[];
 };
 export type Conversation = {
@@ -32,10 +34,12 @@ export type Message = {
 };
 export type Approval = {
   id: string;
+  conversationId: string;
   agentId: string;
   capability: string;
   description: string;
   workspace: string;
+  requestedAt: string;
   expiresIn: string;
 };
 export type Provider = {

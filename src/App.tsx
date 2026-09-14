@@ -25,7 +25,9 @@ import {
   LockKeyhole,
   Menu,
   MessageCircle,
+  Monitor,
   MoreHorizontal,
+  Moon,
   Palette,
   Paperclip,
   Plus,
@@ -35,6 +37,8 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Sun,
+  UserRound,
   X,
   Zap,
 } from "lucide-react";
@@ -63,10 +67,20 @@ type View = "messages" | "inbox" | "activity";
 type CreateAgentInput = Pick<Agent, "name" | "role" | "model" | "runtime"> & {
   memoryEnabled: boolean;
   workspace?: string;
-  personality?: string;
+  instructions?: string;
+};
+type Theme = "system" | "light" | "dark";
+type MentionOption = {
+  id: string;
+  label: string;
+  description: string;
+  color: string;
+  kind: "agent" | "everyone" | "here" | "role";
+  agent?: Agent;
 };
 
 const AVATAR_STYLE_KEY = "opencrew:avatar-style";
+const THEME_KEY = "opencrew:theme";
 const AvatarStyleContext = createContext<AvatarStyle>("blobatar");
 
 const FOCUSABLE =
@@ -156,8 +170,13 @@ export default function App() {
   const [view, setView] = useState<View>("messages");
   const [panel, setPanel] = useState<Panel>("details");
   const [composer, setComposer] = useState("");
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionSuppressed, setMentionSuppressed] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [replying, setReplying] = useState<Message | null>(null);
   const [creating, setCreating] = useState(false);
+  const [profileAgentId, setProfileAgentId] = useState<string | null>(null);
+  const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
   const [sending, setSending] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -178,27 +197,43 @@ export default function App() {
       ? "initials"
       : "blobatar",
   );
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const composerRef = useRef<HTMLTextAreaElement>(null);
-  const scrolledOnce = useRef(false);
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = localStorage.getItem(THEME_KEY);
+    return saved === "light" || saved === "dark" ? saved : "system";
+  });
+  const messageListRef = useRef<HTMLElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
 
   useEffect(() => {
     gateway.bootstrap().then(setData);
   }, []);
   useEffect(() => {
-    const list = bottomRef.current?.parentElement;
-    if (!list) return;
-    // Landing in a conversation should already be at the bottom; only later
-    // messages are worth animating.
-    list.scrollTo({
-      top: list.scrollHeight,
-      behavior: scrolledOnce.current ? "smooth" : "auto",
-    });
-    scrolledOnce.current = true;
-  }, [data?.messages, selected, view]);
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const apply = () => {
+      const resolved = theme === "system" ? (media.matches ? "light" : "dark") : theme;
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.style.colorScheme = resolved;
+      document
+        .querySelector('meta[name="theme-color"]')
+        ?.setAttribute("content", resolved === "light" ? "#f6f6f8" : "#0b0b0c");
+    };
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
   useEffect(() => {
-    scrolledOnce.current = false;
+    stickToBottomRef.current = true;
+    setShowJumpToLatest(false);
   }, [selected]);
+  useEffect(() => {
+    const list = messageListRef.current;
+    if (!list || view !== "messages" || !stickToBottomRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      list.scrollTop = list.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [data?.messages, selected, view, composer, replying]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
@@ -241,8 +276,56 @@ export default function App() {
   const visibleMessages = data.messages.filter(
     (message) => message.conversationId === conversation.id,
   );
+  const conversationApprovals = data.approvals.filter(
+    (approval) => approval.conversationId === conversation.id,
+  );
+  const pendingApprovals = data.approvals.filter(
+    (approval) => !approvalResults[approval.id],
+  );
+  const mentionMatch = composer.match(/(?:^|\s)@([^@\s]*)$/);
+  const mentionQuery = mentionMatch?.[1]?.toLowerCase() ?? "";
+  const roleMentions = Array.from(new Set(activeAgents.map((agent) => agent.role))).map(
+    (role): MentionOption => ({
+      id: `role-${role.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+      label: `@${role}`,
+      description: `Role · ${activeAgents.filter((agent) => agent.role === role).length} ${activeAgents.filter((agent) => agent.role === role).length === 1 ? "member" : "members"}`,
+      color: "#8b7cf6",
+      kind: "role",
+    }),
+  );
+  const allMentionOptions: MentionOption[] = [
+    {
+      id: "everyone",
+      label: "@everyone",
+      description: "Notify everyone in this conversation",
+      color: "#f05b3e",
+      kind: "everyone",
+    },
+    {
+      id: "here",
+      label: "@here",
+      description: "Notify agents currently online",
+      color: "#3fb77a",
+      kind: "here",
+    },
+    ...activeAgents.map((agent): MentionOption => ({
+      id: `agent-${agent.id}`,
+      label: `@${agent.name}`,
+      description: agent.role,
+      color: agent.color,
+      kind: "agent",
+      agent,
+    })),
+    ...roleMentions,
+  ];
+  const mentionOptions = allMentionOptions.filter((option) =>
+    `${option.label} ${option.description}`.toLowerCase().includes(mentionQuery),
+  );
+  const showMentions = Boolean(
+    mentionMatch && mentionOptions.length && !mentionSuppressed,
+  );
   const inboxCount =
-    data.approvals.length +
+    pendingApprovals.length +
     data.conversations.filter((item) => item.unread).length;
 
   async function send() {
@@ -256,6 +339,9 @@ export default function App() {
       time: "Now",
       replyTo: replying?.id,
     };
+    stickToBottomRef.current = true;
+    setShowJumpToLatest(false);
+    composerRef.current?.replaceChildren();
     setComposer("");
     setReplying(null);
     setSending(true);
@@ -267,6 +353,7 @@ export default function App() {
       for await (const streamed of gateway.sendMessage(
         conversation.id,
         value,
+        conversation.type === "dm" ? conversation.agentIds[0] : undefined,
       )) {
         setData(
           (current) =>
@@ -298,6 +385,11 @@ export default function App() {
         "error",
       );
       setComposer(value);
+      requestAnimationFrame(() => {
+        if (composerRef.current && !composerRef.current.innerText.trim()) {
+          composerRef.current.textContent = value;
+        }
+      });
       setData(
         (current) =>
           current && {
@@ -312,6 +404,148 @@ export default function App() {
     }
   }
 
+  function readComposer(editor: HTMLDivElement) {
+    return editor.innerText.replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n");
+  }
+
+  function jumpToLatest() {
+    const list = messageListRef.current;
+    if (!list) return;
+    stickToBottomRef.current = true;
+    setShowJumpToLatest(false);
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function moveCaretAfter(node: Node) {
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    if (node instanceof Text) {
+      range.setStart(node, node.data.length);
+    } else {
+      range.setStartAfter(node);
+    }
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function insertMention(option: MentionOption) {
+    const editor = composerRef.current;
+    if (!editor) return;
+    editor.focus();
+    const selection = window.getSelection();
+    let range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (!range || !editor.contains(range.startContainer)) {
+      range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+    }
+    if (range.startContainer.nodeType === Node.TEXT_NODE) {
+      const node = range.startContainer as Text;
+      const beforeCaret = node.data.slice(0, range.startOffset);
+      const query = beforeCaret.match(/@([^@\s]*)$/);
+      if (query) {
+        range.setStart(node, range.startOffset - query[0].length);
+        range.deleteContents();
+      }
+    }
+    const token = document.createElement("span");
+    token.className = `mention-token mention-token-${option.kind}`;
+    token.contentEditable = "false";
+    token.dataset.mentionLabel = option.label;
+    token.dataset.mentionKind = option.kind;
+    token.style.setProperty("--mention-color", option.color);
+    token.textContent = option.label;
+    range.insertNode(token);
+    const spacer = document.createTextNode(" ");
+    token.after(spacer);
+    moveCaretAfter(spacer);
+    setComposer(readComposer(editor));
+    setMentionIndex(0);
+    setMentionSuppressed(false);
+  }
+
+  function startMention() {
+    const editor = composerRef.current;
+    if (!editor) return;
+    editor.focus();
+    if (/(?:^|\s)@([^@\s]*)$/.test(readComposer(editor))) {
+      setMentionSuppressed(false);
+      return;
+    }
+    const selection = window.getSelection();
+    let range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (!range || !editor.contains(range.startContainer)) {
+      range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+    }
+    range.deleteContents();
+    const current = readComposer(editor);
+    const text = document.createTextNode(current && !/\s$/.test(current) ? " @" : "@");
+    range.insertNode(text);
+    moveCaretAfter(text);
+    setComposer(readComposer(editor));
+    setMentionIndex(0);
+    setMentionSuppressed(false);
+  }
+
+  function deleteMentionBeforeCaret(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Backspace") return false;
+    const editor = composerRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount || !selection.isCollapsed) return false;
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return false;
+    let token: HTMLElement | null = null;
+    let caretNode: Node = range.startContainer;
+    let caretOffset = range.startOffset;
+    if (range.startContainer.nodeType === Node.TEXT_NODE) {
+      const text = range.startContainer as Text;
+      const beforeCaret = text.data.slice(0, range.startOffset);
+      const previous = text.previousSibling;
+      if (/^\s*$/.test(beforeCaret) && previous instanceof HTMLElement && previous.matches(".mention-token")) {
+        token = previous;
+        text.data = text.data.slice(range.startOffset);
+        caretOffset = 0;
+      } else if (range.startOffset === 0 && previous instanceof HTMLElement && previous.matches(".mention-token")) {
+        token = previous;
+      }
+    } else if (range.startContainer instanceof HTMLElement && range.startOffset > 0) {
+      const previous = range.startContainer.childNodes[range.startOffset - 1];
+      if (previous instanceof HTMLElement && previous.matches(".mention-token")) {
+        token = previous;
+        caretOffset = range.startOffset - 1;
+      } else if (
+        previous instanceof Text &&
+        /^\s*$/.test(previous.data) &&
+        previous.previousSibling instanceof HTMLElement &&
+        previous.previousSibling.matches(".mention-token")
+      ) {
+        token = previous.previousSibling;
+        previous.remove();
+        caretOffset = range.startOffset - 2;
+      }
+    }
+    if (!token) return false;
+    event.preventDefault();
+    token.remove();
+    const nextRange = document.createRange();
+    const maximumOffset =
+      caretNode.nodeType === Node.TEXT_NODE
+        ? (caretNode as Text).data.length
+        : caretNode.childNodes.length;
+    nextRange.setStart(caretNode, Math.min(caretOffset, maximumOffset));
+    nextRange.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(nextRange);
+    setComposer(readComposer(editor));
+    setMentionIndex(0);
+    setMentionSuppressed(false);
+    return true;
+  }
+
   async function decide(
     approval: Approval,
     decision: "once" | "always" | "deny",
@@ -320,15 +554,95 @@ export default function App() {
     setApprovalResults((current) => ({ ...current, [approval.id]: decision }));
   }
 
+  async function dismissApproval(approval: Approval) {
+    await gateway.dismissApproval(approval.id);
+    setData(
+      (current) =>
+        current && {
+          ...current,
+          approvals: current.approvals.filter(
+            (item) => item.id !== approval.id,
+          ),
+        },
+    );
+    setApprovalResults((current) => {
+      const next = { ...current };
+      delete next[approval.id];
+      return next;
+    });
+  }
+
   function updateAvatarStyle(style: AvatarStyle) {
     localStorage.setItem(AVATAR_STYLE_KEY, style);
     setAvatarStyle(style);
+  }
+
+  function updateTheme(nextTheme: Theme) {
+    localStorage.setItem(THEME_KEY, nextTheme);
+    setTheme(nextTheme);
+  }
+
+  async function updateAgent(id: string, updates: Partial<Agent>) {
+    const updated = await gateway.updateAgent(id, updates);
+    setData(
+      (current) =>
+        current && {
+          ...current,
+          agents: current.agents.map((agent) =>
+            agent.id === id ? updated : agent,
+          ),
+          conversations: current.conversations.map((item) =>
+            item.type === "dm" && item.agentIds[0] === id
+              ? { ...item, name: updated.name }
+              : item,
+          ),
+        },
+    );
+    return updated;
   }
 
   function openConversation(id: string) {
     setSelected(id);
     setView("messages");
     setMobileNav(false);
+  }
+
+  function openAgentProfile(id: string) {
+    setProfileAgentId(id);
+    setMobileNav(false);
+  }
+
+  function openAgentConversation(id: string) {
+    if (!data) return;
+    const direct = data.conversations.find(
+      (item) => item.type === "dm" && item.agentIds[0] === id,
+    );
+    if (direct) {
+      openConversation(direct.id);
+    } else {
+      const agent = data.agents.find((item) => item.id === id);
+      if (!agent) return;
+      const conversationId = `dm-${agent.id}`;
+      setData((current) =>
+        current && {
+          ...current,
+          conversations: [
+            ...current.conversations,
+            {
+              id: conversationId,
+              name: agent.name,
+              type: "dm",
+              agentIds: [agent.id],
+              preview: "Ready when you are.",
+              time: "Now",
+            },
+          ],
+        },
+      );
+      openConversation(conversationId);
+    }
+    setProfileAgentId(null);
+    setPanel(null);
   }
 
   return (
@@ -466,7 +780,13 @@ export default function App() {
               ) : conversation.type === "group" ? (
                 <Hash size={18} />
               ) : (
-                <Avatar agent={activeAgents[0]} size="small" />
+                <button
+                  className="avatar-button"
+                  onClick={() => activeAgents[0] && openAgentProfile(activeAgents[0].id)}
+                  aria-label={`Open ${activeAgents[0]?.name ?? "agent"} profile`}
+                >
+                  <Avatar agent={activeAgents[0]} size="small" />
+                </button>
               )}
               <div>
                 <strong>
@@ -523,11 +843,28 @@ export default function App() {
 
           {view === "messages" ? (
             <>
-              <section className="message-list">
+              <section
+                className="message-list"
+                ref={messageListRef}
+                onScroll={(event) => {
+                  const list = event.currentTarget;
+                  const nearBottom =
+                    list.scrollHeight - list.scrollTop - list.clientHeight < 96;
+                  stickToBottomRef.current = nearBottom;
+                  setShowJumpToLatest(!nearBottom);
+                }}
+              >
                 <div className="conversation-intro">
                   <div className="stacked-avatars">
                     {activeAgents.map((agent) => (
-                      <Avatar key={agent.id} agent={agent} />
+                      <button
+                        className="avatar-button"
+                        key={agent.id}
+                        onClick={() => openAgentProfile(agent.id)}
+                        aria-label={`Open ${agent.name}'s profile`}
+                      >
+                        <Avatar agent={agent} />
+                      </button>
                     ))}
                   </div>
                   <h1>
@@ -551,28 +888,38 @@ export default function App() {
                     agents={data.agents}
                     allMessages={visibleMessages}
                     onReply={() => setReplying(message)}
+                    onAgentClick={openAgentProfile}
                   />
                 ))}
-                {data.approvals.map(
-                  (approval) =>
-                    conversation.agentIds.includes(approval.agentId) && (
-                      <ApprovalCard
-                        key={approval.id}
-                        approval={approval}
-                        agent={
-                          data.agents.find(
-                            (item) => item.id === approval.agentId,
-                          )!
-                        }
-                        result={approvalResults[approval.id]}
-                        onDecide={(decision) => decide(approval, decision)}
-                      />
-                    ),
-                )}
-                <div ref={bottomRef} />
+                {conversationApprovals.map((approval) => {
+                  const agent = data.agents.find(
+                    (item) => item.id === approval.agentId,
+                  );
+                  return agent ? (
+                    <ApprovalMessage
+                      key={approval.id}
+                      approval={approval}
+                      agent={agent}
+                      result={approvalResults[approval.id]}
+                      onAgentClick={openAgentProfile}
+                      onDecide={(decision) => decide(approval, decision)}
+                      onDismiss={() => dismissApproval(approval)}
+                    />
+                  ) : null;
+                })}
               </section>
 
               <footer className="composer-wrap">
+                {showJumpToLatest && (
+                  <button
+                    type="button"
+                    className="jump-to-latest"
+                    onClick={jumpToLatest}
+                  >
+                    <ChevronDown size={15} />
+                    Jump to latest
+                  </button>
+                )}
                 {replying && (
                   <div className="reply-banner">
                     <Reply size={14} />
@@ -588,19 +935,100 @@ export default function App() {
                   </div>
                 )}
                 <div className="composer">
-                  <textarea
+                  <div
                     ref={composerRef}
-                    value={composer}
-                    onChange={(event) => setComposer(event.target.value)}
+                    className="composer-editor"
+                    contentEditable={!sending}
+                    suppressContentEditableWarning
+                    onInput={(event) => {
+                      setComposer(readComposer(event.currentTarget));
+                      setMentionIndex(0);
+                      setMentionSuppressed(false);
+                    }}
                     onKeyDown={(event) => {
+                      if (deleteMentionBeforeCaret(event)) return;
+                      if (showMentions && event.key === "ArrowDown") {
+                        event.preventDefault();
+                        setMentionIndex((index) => (index + 1) % mentionOptions.length);
+                        return;
+                      }
+                      if (showMentions && event.key === "ArrowUp") {
+                        event.preventDefault();
+                        setMentionIndex((index) =>
+                          (index - 1 + mentionOptions.length) % mentionOptions.length,
+                        );
+                        return;
+                      }
+                      if (showMentions && (event.key === "Enter" || event.key === "Tab")) {
+                        event.preventDefault();
+                        insertMention(mentionOptions[mentionIndex]);
+                        return;
+                      }
+                      if (showMentions && event.key === "Escape") {
+                        event.preventDefault();
+                        setMentionSuppressed(true);
+                        return;
+                      }
                       if (event.key === "Enter" && !event.shiftKey) {
                         event.preventDefault();
                         void send();
                       }
                     }}
-                    placeholder={`Message ${conversation.type === "group" ? "#" : ""}${conversation.name}`}
-                    rows={1}
+                    onPaste={(event) => {
+                      event.preventDefault();
+                      const text = event.clipboardData.getData("text/plain");
+                      const selection = window.getSelection();
+                      if (!selection?.rangeCount) return;
+                      const range = selection.getRangeAt(0);
+                      range.deleteContents();
+                      const node = document.createTextNode(text);
+                      range.insertNode(node);
+                      moveCaretAfter(node);
+                      setComposer(readComposer(event.currentTarget));
+                    }}
+                    data-placeholder={`Message ${conversation.type === "group" ? "#" : ""}${conversation.name}`}
+                    aria-expanded={showMentions}
+                    aria-controls={showMentions ? "mention-suggestions" : undefined}
+                    aria-autocomplete="list"
+                    role="combobox"
+                    aria-activedescendant={
+                      showMentions
+                        ? `mention-option-${mentionOptions[mentionIndex]?.id}`
+                        : undefined
+                    }
+                    aria-label={`Message ${conversation.name}`}
+                    aria-multiline="true"
                   />
+                  {showMentions && (
+                    <div className="mention-menu" id="mention-suggestions" role="listbox" aria-label="Mention people and roles">
+                      <span>Mentions</span>
+                      {mentionOptions.map((option, index) => (
+                        <button
+                          type="button"
+                          role="option"
+                          id={`mention-option-${option.id}`}
+                          aria-selected={index === mentionIndex}
+                          className={index === mentionIndex ? "active" : ""}
+                          key={option.id}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => insertMention(option)}
+                        >
+                          {option.agent ? (
+                            <Avatar agent={option.agent} size="small" />
+                          ) : (
+                            <span
+                              className={`mention-symbol mention-symbol-${option.kind}`}
+                              style={{ "--mention-color": option.color } as React.CSSProperties}
+                            >
+                              {option.kind === "role" ? <UserRound size={15} /> : <AtSign size={15} />}
+                            </span>
+                          )}
+                          <span><strong>{option.label}</strong><small>{option.description}</small></span>
+                          <kbd>Enter</kbd>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <div className="composer-tools">
                     <div>
                       <button
@@ -620,15 +1048,8 @@ export default function App() {
                         <Paperclip size={17} />
                       </button>
                       <button
-                        onClick={() => {
-                          setComposer(
-                            (value) =>
-                              value +
-                              (value.endsWith(" ") || !value ? "@" : " @"),
-                          );
-                          composerRef.current?.focus();
-                        }}
-                        aria-label="Mention an agent"
+                        onClick={startMention}
+                        aria-label="Mention people or roles"
                       >
                         <AtSign size={17} />
                       </button>
@@ -653,7 +1074,7 @@ export default function App() {
           ) : (
             <UtilityView
               view={view}
-              approvals={data.approvals}
+              approvals={pendingApprovals}
               agents={data.agents}
               conversations={data.conversations}
               onOpenConversation={openConversation}
@@ -667,6 +1088,8 @@ export default function App() {
             agents={activeAgents}
             onClose={() => setPanel(null)}
             onNotify={notify}
+            onAgentClick={openAgentProfile}
+            onUpdateAgent={updateAgent}
           />
         )}
         {panel === "settings" && (
@@ -676,14 +1099,16 @@ export default function App() {
             agents={data.agents}
             avatarStyle={avatarStyle}
             onAvatarStyleChange={updateAvatarStyle}
+            theme={theme}
+            onThemeChange={updateTheme}
             onNotify={notify}
             onClose={() => setPanel(null)}
           />
         )}
         {creating && (
-          <CreateAgent
+          <AgentEditor
             onClose={() => setCreating(false)}
-            onCreate={async (agent) => {
+            onSubmit={async (agent) => {
               const created = await gateway.createAgent(agent);
               setData(
                 (current) =>
@@ -707,6 +1132,27 @@ export default function App() {
               setView("messages");
               setPanel("details");
               setCreating(false);
+              notify(`${created.name} joined your crew.`);
+            }}
+          />
+        )}
+        {profileAgentId && !editingAgentId && (
+          <AgentProfileDialog
+            agent={data.agents.find((agent) => agent.id === profileAgentId)!}
+            onClose={() => setProfileAgentId(null)}
+            onEdit={() => setEditingAgentId(profileAgentId)}
+            onMessage={() => openAgentConversation(profileAgentId)}
+          />
+        )}
+        {editingAgentId && (
+          <AgentEditor
+            agent={data.agents.find((agent) => agent.id === editingAgentId)}
+            onClose={() => setEditingAgentId(null)}
+            onSubmit={async (updates) => {
+              const updated = await updateAgent(editingAgentId, updates);
+              setEditingAgentId(null);
+              setProfileAgentId(updated.id);
+              notify(`${updated.name}'s profile was updated.`);
             }}
           />
         )}
@@ -997,11 +1443,13 @@ function MessageItem({
   agents,
   allMessages,
   onReply,
+  onAgentClick,
 }: {
   message: Message;
   agents: Agent[];
   allMessages: Message[];
   onReply: () => void;
+  onAgentClick: (agentId: string) => void;
 }) {
   const agent = agents.find((item) => item.id === message.author);
   const replied = allMessages.find((item) => item.id === message.replyTo);
@@ -1010,7 +1458,13 @@ function MessageItem({
       {message.author === "you" ? (
         <div className="avatar user-avatar">Y</div>
       ) : (
-        <Avatar agent={agent} />
+        <button
+          className="avatar-button message-avatar-button"
+          onClick={() => agent && onAgentClick(agent.id)}
+          aria-label={`Open ${agent?.name ?? "agent"} profile`}
+        >
+          <Avatar agent={agent} />
+        </button>
       )}
       <div className="message-content">
         {replied && (
@@ -1021,7 +1475,11 @@ function MessageItem({
           </div>
         )}
         <div className="message-meta">
-          <strong>{message.author === "you" ? "You" : agent?.name}</strong>
+          {agent ? (
+            <button onClick={() => onAgentClick(agent.id)}>{agent.name}</button>
+          ) : (
+            <strong>You</strong>
+          )}
           {agent && (
             <span
               className={`status ${agent.status}`}
@@ -1033,7 +1491,7 @@ function MessageItem({
           <time>{message.time}</time>
         </div>
         <p>
-          {renderMentions(message.body, agents)}
+          {renderMentions(message.body, agents, onAgentClick)}
           {message.streaming && <i className="cursor" />}
         </p>
         {message.activity && (
@@ -1062,55 +1520,88 @@ function MessageItem({
   );
 }
 
-function ApprovalCard({
+function ApprovalMessage({
   approval,
   agent,
   result,
+  onAgentClick,
   onDecide,
+  onDismiss,
 }: {
   approval: Approval;
   agent: Agent;
   result?: string;
+  onAgentClick: (agentId: string) => void;
   onDecide: (decision: "once" | "always" | "deny") => void;
+  onDismiss: () => void;
 }) {
   return (
-    <div className="approval-card">
-      <div className="approval-head">
-        <div className="approval-icon">
-          <ShieldCheck size={18} />
+    <article className="message approval-message">
+      <button
+        className="avatar-button message-avatar-button"
+        onClick={() => onAgentClick(agent.id)}
+        aria-label={`Open ${agent.name}'s profile`}
+      >
+        <Avatar agent={agent} />
+      </button>
+      <div className="message-content">
+        <div className="message-meta">
+          <button onClick={() => onAgentClick(agent.id)}>{agent.name}</button>
+          <span
+            className={`status ${agent.status}`}
+            role="img"
+            aria-label={agent.status}
+          />
+          <em>{agent.role}</em>
+          <time>{approval.requestedAt}</time>
         </div>
-        <div>
-          <strong>Permission requested</strong>
-          <span>{agent.name} needs your approval</span>
+        <div className="approval-card">
+          <div className="approval-head">
+            <div className="approval-icon">
+              <ShieldCheck size={18} />
+            </div>
+            <div>
+              <strong>Permission requested</strong>
+              <span>{agent.name} needs your approval</span>
+            </div>
+            <time title="Time remaining">{approval.expiresIn}</time>
+            <button
+              className="approval-dismiss"
+              onClick={onDismiss}
+              aria-label="Dismiss permission request"
+              title="Dismiss"
+            >
+              <X size={15} />
+            </button>
+          </div>
+          <div className="approval-command">
+            <code>{approval.capability}</code>
+            <p>{approval.description}</p>
+            <span>
+              <Folder size={14} /> {approval.workspace}
+            </span>
+          </div>
+          {result ? (
+            <div className="approval-result">
+              <Check size={16} />{" "}
+              {result === "deny"
+                ? "Request denied"
+                : result === "always"
+                  ? "Allowed for this workspace"
+                  : "Allowed once"}
+            </div>
+          ) : (
+            <div className="approval-actions">
+              <button onClick={() => onDecide("deny")}>Deny</button>
+              <button onClick={() => onDecide("always")}>Always allow</button>
+              <button className="approve" onClick={() => onDecide("once")}>
+                Allow once
+              </button>
+            </div>
+          )}
         </div>
-        <time>{approval.expiresIn}</time>
       </div>
-      <div className="approval-command">
-        <code>{approval.capability}</code>
-        <p>{approval.description}</p>
-        <span>
-          <Folder size={14} /> {approval.workspace}
-        </span>
-      </div>
-      {result ? (
-        <div className="approval-result">
-          <Check size={16} />{" "}
-          {result === "deny"
-            ? "Request denied"
-            : result === "always"
-              ? "Allowed for this workspace"
-              : "Allowed once"}
-        </div>
-      ) : (
-        <div className="approval-actions">
-          <button onClick={() => onDecide("deny")}>Deny</button>
-          <button onClick={() => onDecide("always")}>Always allow</button>
-          <button className="approve" onClick={() => onDecide("once")}>
-            Allow once
-          </button>
-        </div>
-      )}
-    </div>
+    </article>
   );
 }
 
@@ -1119,20 +1610,26 @@ function DetailsPanel({
   agents,
   onClose,
   onNotify,
+  onAgentClick,
+  onUpdateAgent,
 }: {
   conversation: Conversation;
   agents: Agent[];
   onClose: () => void;
   onNotify: (message: string) => void;
+  onAgentClick: (agentId: string) => void;
+  onUpdateAgent: (id: string, updates: Partial<Agent>) => Promise<Agent>;
 }) {
   const [tab, setTab] = useState<"people" | "memory">("people");
   const [memoryAgentId, setMemoryAgentId] = useState(agents[0]?.id ?? "");
+  const agentIds = agents.map((agent) => agent.id).join(",");
   const memoryAgent =
     agents.find((agent) => agent.id === memoryAgentId) ?? agents[0];
   const [memory, setMemory] = useState(memoryAgent?.memory.join("\n") ?? "");
+  const [savingMemory, setSavingMemory] = useState(false);
   useEffect(() => {
     setMemoryAgentId(agents[0]?.id ?? "");
-  }, [conversation.id, agents]);
+  }, [conversation.id, agentIds]);
   useEffect(() => {
     setMemory(memoryAgent?.memory.join("\n") ?? "");
   }, [memoryAgent]);
@@ -1167,7 +1664,12 @@ function DetailsPanel({
       {tab === "people" ? (
         <div className="details-content">
           {agents.map((agent) => (
-            <div className="agent-profile" key={agent.id}>
+            <button
+              className="agent-profile"
+              key={agent.id}
+              onClick={() => onAgentClick(agent.id)}
+              aria-label={`Open ${agent.name}'s profile`}
+            >
               <Avatar agent={agent} size="large" />
               <h3>{agent.name}</h3>
               <p>{agent.role}</p>
@@ -1192,7 +1694,10 @@ function DetailsPanel({
                   </>
                 )}
               </div>
-            </div>
+              <span className="profile-open">
+                View profile <ChevronRight size={14} />
+              </span>
+            </button>
           ))}
         </div>
       ) : (
@@ -1227,9 +1732,24 @@ function DetailsPanel({
           <div className="memory-footer">
             <span>{memory.split("\n").filter(Boolean).length} memories</span>
             <button
-              onClick={() => onNotify(`Memory saved for ${memoryAgent?.name}.`)}
+              disabled={savingMemory}
+              onClick={async () => {
+                if (!memoryAgent) return;
+                setSavingMemory(true);
+                try {
+                  await onUpdateAgent(memoryAgent.id, {
+                    memory: memory
+                      .split("\n")
+                      .map((item) => item.trim())
+                      .filter(Boolean),
+                  });
+                  onNotify(`Memory saved for ${memoryAgent.name}.`);
+                } finally {
+                  setSavingMemory(false);
+                }
+              }}
             >
-              Save memory
+              {savingMemory ? "Saving…" : "Save memory"}
             </button>
           </div>
           <p className="muted-copy">
@@ -1248,6 +1768,8 @@ function SettingsPanel({
   agents,
   avatarStyle,
   onAvatarStyleChange,
+  theme,
+  onThemeChange,
   onNotify,
   onClose,
 }: {
@@ -1256,6 +1778,8 @@ function SettingsPanel({
   agents: Agent[];
   avatarStyle: AvatarStyle;
   onAvatarStyleChange: (style: AvatarStyle) => void;
+  theme: Theme;
+  onThemeChange: (theme: Theme) => void;
   onNotify: (message: string) => void;
   onClose: () => void;
 }) {
@@ -1375,9 +1899,35 @@ function SettingsPanel({
           <>
             <div className="section-heading">
               <div>
-                <h3>Agent avatars</h3>
-                <p>Choose how agents appear throughout OpenCrew.</p>
+                <h3>Appearance</h3>
+                <p>Make OpenCrew comfortable in your environment.</p>
               </div>
+            </div>
+            <fieldset className="theme-options">
+              <legend>Color theme</legend>
+              {([
+                ["system", Monitor, "System"],
+                ["light", Sun, "Light"],
+                ["dark", Moon, "Dark"],
+              ] as const).map(([value, Icon, label]) => (
+                <label className={theme === value ? "selected" : ""} key={value}>
+                  <input
+                    type="radio"
+                    name="color-theme"
+                    value={value}
+                    checked={theme === value}
+                    onChange={() => onThemeChange(value)}
+                  />
+                  <Icon size={17} />
+                  <span>{label}</span>
+                  <i>{theme === value && <Check size={13} />}</i>
+                </label>
+              ))}
+            </fieldset>
+            <div className="preference-divider" />
+            <div className="preference-heading">
+              <strong>Agent avatars</strong>
+              <span>Choose how your crew appears.</span>
             </div>
             <fieldset className="avatar-options">
               <legend>Avatar style</legend>
@@ -1801,24 +2351,139 @@ function ProviderSetup({
   );
 }
 
-function CreateAgent({
+function AgentProfileDialog({
+  agent,
   onClose,
-  onCreate,
+  onEdit,
+  onMessage,
 }: {
+  agent: Agent;
   onClose: () => void;
-  onCreate: (agent: CreateAgentInput) => Promise<void>;
+  onEdit: () => void;
+  onMessage: () => void;
 }) {
   const dialogRef = useDialog(onClose);
-  const [name, setName] = useState("");
-  const [role, setRole] = useState("");
-  const [advanced, setAdvanced] = useState(false);
-  const [model, setModel] = useState("Auto");
-  const [runtime, setRuntime] = useState("Chat");
-  const [workspace, setWorkspace] = useState("");
-  const [personality, setPersonality] = useState("");
-  const [memoryEnabled, setMemoryEnabled] = useState(true);
+  return (
+    <div
+      className="modal-layer"
+      onMouseDown={(event) => event.currentTarget === event.target && onClose()}
+    >
+      <div
+        ref={dialogRef}
+        className="modal profile-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agent-profile-title"
+      >
+        <header className="compact-modal-header">
+          <div>
+            <span className="eyebrow">Agent profile</span>
+            <h2 id="agent-profile-title">{agent.name}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close profile">
+            <X size={18} />
+          </button>
+        </header>
+        <div className="profile-modal-body">
+          <div className="profile-hero">
+            <Avatar agent={agent} size="large" />
+            <div>
+              <h3>{agent.name}</h3>
+              <p>{agent.role}</p>
+              <span className="online-label">
+                <i className={`status ${agent.status}`} /> {agent.status}
+              </span>
+            </div>
+          </div>
+          <dl className="agent-facts">
+            <div><dt><Bot size={15} /> Model</dt><dd>{agent.model}</dd></div>
+            <div><dt><Cpu size={15} /> Runtime</dt><dd>{agent.runtime}</dd></div>
+            <div><dt><Folder size={15} /> Workspace</dt><dd>{agent.workspace ?? "Not connected"}</dd></div>
+            <div><dt><Database size={15} /> Memory</dt><dd>{agent.memoryEnabled === false ? "Off" : `${agent.memory.length} saved`}</dd></div>
+          </dl>
+          {agent.instructions && (
+            <section className="profile-instructions">
+              <span>Working instructions</span>
+              <p>{agent.instructions}</p>
+            </section>
+          )}
+        </div>
+        <footer>
+          <button className="secondary-button" onClick={onEdit}>Edit profile</button>
+          <button className="primary-button" onClick={onMessage}>
+            <MessageCircle size={16} /> Message {agent.name}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function AgentEditor({
+  agent,
+  onClose,
+  onSubmit,
+}: {
+  agent?: Agent;
+  onClose: () => void;
+  onSubmit: (agent: CreateAgentInput) => Promise<void>;
+}) {
+  const dialogRef = useDialog(onClose);
+  const [name, setName] = useState(agent?.name ?? "");
+  const [role, setRole] = useState(agent?.role ?? "");
+  const [advanced, setAdvanced] = useState(
+    Boolean(agent?.workspace || agent?.instructions),
+  );
+  const [model, setModel] = useState(agent?.model ?? "Auto");
+  const [runtime, setRuntime] = useState(agent?.runtime ?? "Chat");
+  const [workspace, setWorkspace] = useState(agent?.workspace ?? "");
+  const [instructions, setInstructions] = useState(agent?.instructions ?? "");
+  const [memoryEnabled, setMemoryEnabled] = useState(
+    agent?.memoryEnabled !== false,
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const editing = Boolean(agent);
+  const templates = [
+    ["Product", "Product strategist", "Claude Sonnet 4", "Chat", "Turn ambiguous ideas into concise plans, tradeoffs, and next steps."],
+    ["Engineering", "Staff engineer", "Auto", "Codex", "Work carefully in the repository, explain important decisions, and verify changes."],
+    ["Research", "Research partner", "GPT-5", "Chat", "Find reliable evidence, distinguish facts from inference, and cite primary sources."],
+  ] as const;
+  const previewAgent: Agent = {
+    id: agent?.id ?? "agent-preview",
+    name: name.trim() || "New agent",
+    initials: (name.trim().charAt(0) || "N").toUpperCase(),
+    role: role.trim() || "Add a clear role",
+    color: agent?.color ?? "#7857d8",
+    status: agent?.status ?? "online",
+    model,
+    runtime,
+    workspace: workspace || undefined,
+    memory: agent?.memory ?? [],
+    memoryEnabled,
+    instructions,
+  };
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!name.trim() || !role.trim() || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onSubmit({
+        name: name.trim(),
+        role: role.trim(),
+        model,
+        runtime,
+        memoryEnabled,
+        workspace: runtime === "Chat" ? undefined : workspace || undefined,
+        instructions: instructions.trim() || undefined,
+      });
+    } catch {
+      setError(`The agent could not be ${editing ? "updated" : "created"}. Please try again.`);
+      setSaving(false);
+    }
+  }
   return (
     <div
       className="modal-layer"
@@ -1828,43 +2493,79 @@ function CreateAgent({
     >
       <div
         ref={dialogRef}
-        className="modal"
+        className="modal agent-editor-modal"
         role="dialog"
         aria-modal="true"
-        aria-label="Create an agent"
+        aria-labelledby="agent-editor-title"
       >
         <header>
           <div>
-            <span className="eyebrow">New teammate</span>
-            <h2>Create an agent</h2>
-            <p>Start simple. You can tune everything later.</p>
+            <span className="eyebrow">{editing ? "Agent settings" : "New teammate"}</span>
+            <h2 id="agent-editor-title">{editing ? `Edit ${agent?.name}` : "Create an agent"}</h2>
+            <p>{editing ? "Changes apply everywhere this agent appears." : "Choose a clear role now. Fine-tune the rest whenever you need."}</p>
           </div>
           <button
             className="icon-button"
             onClick={onClose}
-            aria-label="Close agent creation"
+            aria-label={editing ? "Close agent editor" : "Close agent creation"}
           >
             <X size={18} />
           </button>
         </header>
-        <div className="form">
+        <form id="agent-editor-form" className="form agent-form" onSubmit={submit}>
+          <div className="agent-draft-card">
+            <Avatar agent={previewAgent} size="large" />
+            <div>
+              <strong>{previewAgent.name}</strong>
+              <span>{previewAgent.role}</span>
+            </div>
+            <small>{model}</small>
+          </div>
+          {!editing && (
+            <div className="template-picker">
+              <span>Start with a role</span>
+              <div>
+                {templates.map(([label, templateRole, templateModel, templateRuntime, templateInstructions]) => (
+                  <button
+                    type="button"
+                    key={label}
+                    onClick={() => {
+                      setRole(templateRole);
+                      setModel(templateModel);
+                      setRuntime(templateRuntime);
+                      setInstructions(templateInstructions);
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="form-section-label">Identity</div>
           <label>
-            Name
+            <span>Name <em>Required</em></span>
             <input
               autoFocus
+              required
+              maxLength={48}
               value={name}
               onChange={(event) => setName(event.target.value)}
               placeholder="e.g. Maya"
             />
           </label>
           <label>
-            Role
-            <textarea
+            <span>Role <em>Required</em></span>
+            <input
+              required
+              maxLength={72}
               value={role}
               onChange={(event) => setRole(event.target.value)}
-              placeholder="What should this agent be great at?"
+              placeholder="e.g. Product strategist"
             />
+            <small className="field-description">A short title people will recognize in conversations.</small>
           </label>
+          <div className="form-section-label">How this agent works</div>
           <div className="simple-options">
             <label>
               Model
@@ -1878,19 +2579,31 @@ function CreateAgent({
                 <option>Gemini 2.5 Pro</option>
               </select>
             </label>
-            <label className="memory-toggle">
-              <span>
-                Memory<strong>Remember useful context</strong>
-              </span>
-              <input
-                type="checkbox"
-                checked={memoryEnabled}
-                onChange={(event) => setMemoryEnabled(event.target.checked)}
-              />
-              <i />
+            <label>
+              Runtime
+              <select
+                value={runtime}
+                onChange={(event) => setRuntime(event.target.value)}
+              >
+                <option>Chat</option>
+                <option>Claude Code</option>
+                <option>Codex</option>
+              </select>
             </label>
           </div>
+          <label className="memory-toggle">
+            <span>
+              Memory<strong>Keep useful context across conversations</strong>
+            </span>
+            <input
+              type="checkbox"
+              checked={memoryEnabled}
+              onChange={(event) => setMemoryEnabled(event.target.checked)}
+            />
+            <i />
+          </label>
           <button
+            type="button"
             className="advanced-toggle"
             aria-expanded={advanced}
             onClick={() => setAdvanced(!advanced)}
@@ -1901,66 +2614,51 @@ function CreateAgent({
           {advanced && (
             <div className="advanced-options">
               <label>
-                Runtime
-                <select
-                  value={runtime}
-                  onChange={(event) => setRuntime(event.target.value)}
-                >
-                  <option>Chat</option>
-                  <option>Claude Code</option>
-                  <option>Codex</option>
-                </select>
-              </label>
-              <label>
                 Workspace
                 <select
+                  disabled={runtime === "Chat"}
                   value={workspace}
                   onChange={(event) => setWorkspace(event.target.value)}
                 >
                   <option value="">No workspace</option>
                   <option value="opencrew.dev">opencrew.dev</option>
                 </select>
+                <small className="field-description">
+                  {runtime === "Chat"
+                    ? "Choose a coding runtime to attach a workspace."
+                    : "The folder this agent can work in."}
+                </small>
               </label>
               <label>
-                Personality
+                Working instructions
                 <textarea
-                  value={personality}
-                  onChange={(event) => setPersonality(event.target.value)}
-                  placeholder="Tone, preferences, and working style…"
+                  value={instructions}
+                  onChange={(event) => setInstructions(event.target.value)}
+                  placeholder="Priorities, working style, and boundaries…"
                 />
               </label>
             </div>
           )}
-          {error && <div className="form-error">{error}</div>}
-        </div>
+          {error && <div className="form-error" role="alert">{error}</div>}
+        </form>
         <footer>
-          <button className="secondary-button" onClick={onClose}>
+          <button type="button" className="secondary-button" onClick={onClose}>
             Cancel
           </button>
           <button
+            type="submit"
+            form="agent-editor-form"
             className="primary-button"
             disabled={!name.trim() || !role.trim() || saving}
-            onClick={async () => {
-              setSaving(true);
-              setError("");
-              try {
-                await onCreate({
-                  name: name.trim(),
-                  role: role.trim(),
-                  model,
-                  runtime,
-                  memoryEnabled,
-                  workspace: workspace || undefined,
-                  personality: personality.trim() || undefined,
-                });
-              } catch {
-                setError("The agent could not be created. Please try again.");
-                setSaving(false);
-              }
-            }}
           >
-            {saving ? "Creating…" : "Create agent"}
-            <Sparkles size={16} />
+            {saving
+              ? editing
+                ? "Saving…"
+                : "Creating…"
+              : editing
+                ? "Save changes"
+                : "Create agent"}
+            {editing ? <Check size={16} /> : <Sparkles size={16} />}
           </button>
         </footer>
       </div>
@@ -2137,15 +2835,79 @@ function authorName(id: string, agents: Agent[]) {
     ? "You"
     : (agents.find((agent) => agent.id === id)?.name ?? "Agent");
 }
-function renderMentions(body: string, agents: Agent[]) {
-  const names = agents.map((agent) => agent.name);
-  return body
-    .split(/(@\w+)/g)
-    .map((part, index) =>
-      names.some((name) => part.toLowerCase() === `@${name.toLowerCase()}`) ? (
-        <mark key={index}>{part}</mark>
-      ) : (
-        part
-      ),
+function renderMentions(
+  body: string,
+  agents: Agent[],
+  onAgentClick: (agentId: string) => void,
+) {
+  const roleOptions = Array.from(new Set(agents.map((agent) => agent.role))).map(
+    (role): MentionOption => ({
+      id: `role-${role}`,
+      label: `@${role}`,
+      description: "Role",
+      color: "#8b7cf6",
+      kind: "role",
+    }),
+  );
+  const options: MentionOption[] = [
+    {
+      id: "everyone",
+      label: "@everyone",
+      description: "Everyone",
+      color: "#f05b3e",
+      kind: "everyone",
+    },
+    {
+      id: "here",
+      label: "@here",
+      description: "Online now",
+      color: "#3fb77a",
+      kind: "here",
+    },
+    ...agents.map((agent) => ({
+      id: `agent-${agent.id}`,
+      label: `@${agent.name}`,
+      description: agent.role,
+      color: agent.color,
+      kind: "agent" as const,
+      agent,
+    })),
+    ...roleOptions,
+  ];
+  const escapedLabels = options
+    .map((option) => option.label.slice(1))
+    .sort((a, b) => b.length - a.length)
+    .map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const matcher = new RegExp(
+    `(@(?:${escapedLabels.join("|")}))(?![\\p{L}\\p{N}_-])`,
+    "giu",
+  );
+  return body.split(matcher).map((part, index) => {
+    const option = options.find(
+      (item) => item.label.toLowerCase() === part.toLowerCase(),
     );
+    if (!option) return part;
+    const mentionStyle = {
+      "--mention-color": option.color,
+    } as React.CSSProperties;
+    return option.agent ? (
+      <button
+        type="button"
+        className={`mention mention-${option.kind}`}
+        style={mentionStyle}
+        key={`${option.id}-${index}`}
+        onClick={() => onAgentClick(option.agent!.id)}
+      >
+        {part}
+      </button>
+    ) : (
+      <mark
+        className={`mention mention-${option.kind}`}
+        style={mentionStyle}
+        key={`${option.id}-${index}`}
+      >
+        {part}
+      </mark>
+    );
+  });
 }

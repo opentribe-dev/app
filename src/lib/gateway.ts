@@ -18,6 +18,8 @@ const agents: Agent[] = [
     status: "online",
     model: "Claude Sonnet 4",
     runtime: "Chat",
+    memoryEnabled: true,
+    instructions: "Turn ambiguous product ideas into clear stories, decisions, and next steps.",
     memory: [
       "OpenCrew targets small technical teams.",
       "Prefer concise product briefs.",
@@ -34,6 +36,8 @@ const agents: Agent[] = [
     model: "Auto",
     runtime: "Claude Code",
     workspace: "opencrew.dev",
+    memoryEnabled: true,
+    instructions: "Work carefully in the repository, explain important tradeoffs, and verify every change.",
     memory: [
       "Use Go for local services.",
       "Keep the self-hosted stack to one process.",
@@ -48,6 +52,8 @@ const agents: Agent[] = [
     status: "online",
     model: "GPT-5",
     runtime: "Chat",
+    memoryEnabled: true,
+    instructions: "Use reliable evidence, cite primary sources, and separate facts from inference.",
     memory: ["Cite primary sources."],
   },
   {
@@ -60,6 +66,8 @@ const agents: Agent[] = [
     model: "Auto",
     runtime: "Codex",
     workspace: "opencrew.dev",
+    memoryEnabled: false,
+    instructions: "Look for regressions, unclear states, and edge cases before a release ships.",
     memory: [],
   },
 ];
@@ -163,10 +171,12 @@ const providers: Provider[] = [
 const approvals: Approval[] = [
   {
     id: "a1",
+    conversationId: "launch",
     agentId: "linus",
     capability: "shell.run",
     description: "Run the app production build",
     workspace: "~/Code/opencrew.dev",
+    requestedAt: "9:45",
     expiresIn: "4:52",
   },
 ];
@@ -198,11 +208,11 @@ export const gateway = {
   async bootstrap() {
     await delay();
     return {
-      agents,
-      conversations,
-      messages,
-      providers,
-      approvals,
+      agents: agents.map((agent) => ({ ...agent, memory: [...agent.memory] })),
+      conversations: conversations.map((conversation) => ({ ...conversation, agentIds: [...conversation.agentIds] })),
+      messages: messages.map((message) => ({ ...message })),
+      providers: providers.map((provider) => ({ ...provider })),
+      approvals: approvals.map((approval) => ({ ...approval })),
       device: localDevice(),
     };
   },
@@ -212,27 +222,65 @@ export const gateway = {
       "name" | "role" | "model" | "runtime" | "workspace"
     > & {
       memoryEnabled?: boolean;
-      personality?: string;
+      instructions?: string;
     },
   ): Promise<Agent> {
     await delay(260);
-    const { memoryEnabled = true, personality, ...agent } = input;
-    return {
+    const { memoryEnabled = true, instructions, ...agent } = input;
+    const created: Agent = {
       id: crypto.randomUUID(),
       initials: agent.name.slice(0, 1).toUpperCase(),
       color: "#7857d8",
       status: "online",
-      memory: memoryEnabled && personality ? [personality] : [],
+      memoryEnabled,
+      instructions,
+      memory: [],
       ...agent,
     };
+    agents.push(created);
+    return created;
+  },
+  async updateAgent(
+    id: string,
+    input: Partial<
+      Pick<
+        Agent,
+        | "name"
+        | "role"
+        | "model"
+        | "runtime"
+        | "workspace"
+        | "instructions"
+        | "memoryEnabled"
+        | "memory"
+      >
+    >,
+  ): Promise<Agent> {
+    await delay(220);
+    const current = agents.find((agent) => agent.id === id);
+    if (!current) throw new Error("Agent not found");
+    const updated = {
+      ...current,
+      ...input,
+      initials: input.name?.slice(0, 1).toUpperCase() ?? current.initials,
+    };
+    agents.splice(agents.indexOf(current), 1, updated);
+    return updated;
   },
   async approve(_id: string, _decision: "once" | "always" | "deny") {
     await delay(180);
     return true;
   },
+  async dismissApproval(id: string) {
+    await delay(120);
+    const index = approvals.findIndex((approval) => approval.id === id);
+    if (index !== -1) approvals.splice(index, 1);
+    return true;
+  },
   async *sendMessage(
     conversationId: string,
     body: string,
+    preferredAgentId?: string,
   ): AsyncGenerator<Message> {
     await delay(350);
     const conversation = conversations.find((item) => item.id === conversationId);
@@ -241,6 +289,7 @@ export const gateway = {
     );
     const respondingAgent =
       mentionedAgent ??
+      agents.find((agent) => agent.id === preferredAgentId) ??
       agents.find((agent) => conversation?.agentIds.includes(agent.id)) ??
       agents[0];
     const answer = body.toLowerCase().includes("launch")
