@@ -1,4 +1,4 @@
-export type Status = "online" | "thinking" | "offline";
+export type Status = "online" | "thinking" | "offline" | "unknown";
 export type Agent = {
   id: string;
   name: string;
@@ -7,6 +7,7 @@ export type Agent = {
   color: string;
   status: Status;
   model: string;
+  providerId?: string;
   runtime: string;
   workspace?: string;
   instructions?: string;
