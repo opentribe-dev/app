@@ -207,10 +207,18 @@ export default function App() {
   const stickToBottomRef = useRef(true);
 
   useEffect(() => {
-    gateway.bootstrap().then(setData).catch((error) => setLoadError(String(error)));
-    return startRealtime((message) => setData((current) => current && ({ ...current,
-      messages: current.messages.some((m) => m.id === message.id) ? current.messages : [...current.messages, message] })),
-      (error) => notify(error, 'error'));
+    let cancelled = false;
+    let stopRealtime = () => {};
+    void gateway.bootstrap().then((initial) => {
+      if (cancelled) return;
+      setData(initial);
+      // Replay events after history loads so a reply arriving during bootstrap
+      // cannot be discarded while data is still null.
+      stopRealtime = startRealtime((message) => setData((current) => current && ({ ...current,
+        messages: current.messages.some((m) => m.id === message.id) ? current.messages : [...current.messages, message] })),
+        (error) => notify(error, 'error'));
+    }).catch((error) => { if (!cancelled) setLoadError(String(error)); });
+    return () => { cancelled = true; stopRealtime(); };
   }, []);
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: light)");
