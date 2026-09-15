@@ -43,6 +43,8 @@ import {
   Zap,
 } from "lucide-react";
 import { gateway } from "./lib/gateway";
+import { startRealtime, resubscribeConversations } from "./lib/realtime/events";
+import { ProviderConnect } from "./features/providers/ProviderConnect";
 import type {
   Agent,
   Approval,
@@ -65,6 +67,7 @@ type Toast = { message: string; tone: "info" | "error" };
 type AvatarStyle = "blobatar" | "initials";
 type View = "messages" | "inbox" | "activity";
 type CreateAgentInput = Pick<Agent, "name" | "role" | "model" | "runtime"> & {
+  providerId: string;
   memoryEnabled: boolean;
   workspace?: string;
   instructions?: string;
@@ -166,6 +169,7 @@ const SEARCH_HINT = isApple ? "⌘ K" : "Ctrl K";
 
 export default function App() {
   const [data, setData] = useState<Bootstrap | null>(null);
+  const [loadError, setLoadError] = useState('');
   const [selected, setSelected] = useState("launch");
   const [view, setView] = useState<View>("messages");
   const [panel, setPanel] = useState<Panel>("details");
@@ -186,9 +190,6 @@ export default function App() {
     [],
   );
   const [mobileNav, setMobileNav] = useState(false);
-  const [onboarding, setOnboarding] = useState(
-    () => !localStorage.getItem("opencrew:onboarded"),
-  );
   const [approvalResults, setApprovalResults] = useState<
     Record<string, string>
   >({});
@@ -206,7 +207,10 @@ export default function App() {
   const stickToBottomRef = useRef(true);
 
   useEffect(() => {
-    gateway.bootstrap().then(setData);
+    gateway.bootstrap().then(setData).catch((error) => setLoadError(String(error)));
+    return startRealtime((message) => setData((current) => current && ({ ...current,
+      messages: current.messages.some((m) => m.id === message.id) ? current.messages : [...current.messages, message] })),
+      (error) => notify(error, 'error'));
   }, []);
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: light)");
@@ -254,18 +258,25 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  if (!data) return <Loading />;
-  if (onboarding)
-    return (
-      <Onboarding
-        onDone={() => {
-          localStorage.setItem("opencrew:onboarded", "1");
-          setOnboarding(false);
-        }}
-        providers={data.providers}
-        device={data.device}
-      />
-    );
+  if (!data) return loadError ? <div role="alert">{loadError}</div> : <Loading />;
+  if (!data.providers.length) return <ProviderConnect onConnected={() => void gateway.bootstrap().then(setData)} />;
+  if (!data.conversations.length) return <div className="onboarding"><div className="onboarding-body"><div className="onboarding-card">
+    <h1>Your crew</h1><p>{data.agents.length ? 'Open a DM with an agent.' : 'Create your first agent.'}</p>
+    {data.agents.map((agent) => <button className="secondary-button" key={agent.id} onClick={async () => {
+      try { const dm = await gateway.createDm(agent.id, data.agents); resubscribeConversations();
+        setData((current) => current && ({ ...current, conversations: [...current.conversations, dm] }));
+        setSelected(dm.id);
+      } catch (error) { notify(String(error), 'error'); }
+    }}>{agent.name} · Open DM</button>)}
+    <button className="primary-button" onClick={() => setCreating(true)}>Create agent</button>
+    <button className="secondary-button" onClick={() => void gateway.logout()}>Log out</button>
+    {creating && <AgentEditor providers={data.providers} onClose={() => setCreating(false)} onSubmit={async (input) => {
+      const agent = await gateway.createAgent(input);
+      const dm = await gateway.createDm(agent.id, [...data.agents, agent]); resubscribeConversations();
+      setData((current) => current && ({ ...current, agents: [...current.agents, agent], conversations: [...current.conversations, dm] }));
+      setSelected(dm.id); setCreating(false);
+    }} />}
+  </div></div></div>;
 
   const conversation =
     data.conversations.find((item) => item.id === selected) ??
@@ -331,54 +342,16 @@ export default function App() {
   async function send() {
     const value = composer.trim();
     if (!value || sending) return;
-    const mine: Message = {
-      id: crypto.randomUUID(),
-      conversationId: conversation.id,
-      author: "you",
-      body: value,
-      time: "Now",
-      replyTo: replying?.id,
-    };
     stickToBottomRef.current = true;
     setShowJumpToLatest(false);
     composerRef.current?.replaceChildren();
     setComposer("");
     setReplying(null);
     setSending(true);
-    setData(
-      (current) =>
-        current && { ...current, messages: [...current.messages, mine] },
-    );
     try {
-      for await (const streamed of gateway.sendMessage(
-        conversation.id,
-        value,
-        conversation.type === "dm" ? conversation.agentIds[0] : undefined,
-      )) {
-        setData(
-          (current) =>
-            current && {
-              ...current,
-              messages: [
-                ...current.messages.filter(
-                  (message) => message.id !== "stream",
-                ),
-                streamed,
-              ],
-            },
-        );
-      }
-      setData(
-        (current) =>
-          current && {
-            ...current,
-            messages: current.messages.map((message) =>
-              message.id === "stream"
-                ? { ...message, id: crypto.randomUUID(), streaming: false }
-                : message,
-            ),
-          },
-      );
+      const sent = await gateway.sendMessage(conversation.id, value, replying?.id);
+      setData((current) => current && { ...current,
+        messages: current.messages.some((m) => m.id === sent.id) ? current.messages : [...current.messages, sent] });
     } catch {
       notify(
         "Message could not be delivered. Your draft was restored.",
@@ -390,15 +363,6 @@ export default function App() {
           composerRef.current.textContent = value;
         }
       });
-      setData(
-        (current) =>
-          current && {
-            ...current,
-            messages: current.messages.filter(
-              (message) => message.id !== "stream" && message.id !== mine.id,
-            ),
-          },
-      );
     } finally {
       setSending(false);
     }
@@ -612,37 +576,18 @@ export default function App() {
     setMobileNav(false);
   }
 
-  function openAgentConversation(id: string) {
+  async function openAgentConversation(id: string) {
     if (!data) return;
-    const direct = data.conversations.find(
-      (item) => item.type === "dm" && item.agentIds[0] === id,
-    );
-    if (direct) {
-      openConversation(direct.id);
-    } else {
-      const agent = data.agents.find((item) => item.id === id);
-      if (!agent) return;
-      const conversationId = `dm-${agent.id}`;
-      setData((current) =>
-        current && {
-          ...current,
-          conversations: [
-            ...current.conversations,
-            {
-              id: conversationId,
-              name: agent.name,
-              type: "dm",
-              agentIds: [agent.id],
-              preview: "Ready when you are.",
-              time: "Now",
-            },
-          ],
-        },
-      );
-      openConversation(conversationId);
-    }
-    setProfileAgentId(null);
-    setPanel(null);
+    try {
+      const direct = data.conversations.find((item) => item.type === 'dm' && item.agentIds[0] === id);
+      const dm = direct ?? await gateway.createDm(id, data.agents);
+      if (!direct) {
+        resubscribeConversations();
+        setData((current) => current && ({ ...current, conversations: [...current.conversations, dm] }));
+      }
+      openConversation(dm.id);
+      setProfileAgentId(null); setPanel(null);
+    } catch (error) { notify(String(error), 'error'); }
   }
 
   return (
@@ -1102,36 +1047,21 @@ export default function App() {
             theme={theme}
             onThemeChange={updateTheme}
             onNotify={notify}
+            onProvidersChanged={() => void gateway.bootstrap().then(setData)}
             onClose={() => setPanel(null)}
           />
         )}
         {creating && (
           <AgentEditor
             onClose={() => setCreating(false)}
-            onSubmit={async (agent) => {
-              const created = await gateway.createAgent(agent);
-              setData(
-                (current) =>
-                  current && {
-                    ...current,
-                    agents: [...current.agents, created],
-                    conversations: [
-                      ...current.conversations,
-                      {
-                        id: `dm-${created.id}`,
-                        name: created.name,
-                        type: "dm",
-                        agentIds: [created.id],
-                        preview: "Ready when you are.",
-                        time: "Now",
-                      },
-                    ],
-                  },
-              );
-              setSelected(`dm-${created.id}`);
-              setView("messages");
-              setPanel("details");
-              setCreating(false);
+            providers={data.providers}
+            onSubmit={async (input) => {
+              const created = await gateway.createAgent(input);
+              const dm = await gateway.createDm(created.id, [...data.agents, created]);
+              resubscribeConversations();
+              setData((current) => current && ({ ...current,
+                agents: [...current.agents, created], conversations: [...current.conversations, dm] }));
+              setSelected(dm.id); setView('messages'); setCreating(false);
               notify(`${created.name} joined your crew.`);
             }}
           />
@@ -1148,6 +1078,7 @@ export default function App() {
           <AgentEditor
             agent={data.agents.find((agent) => agent.id === editingAgentId)}
             onClose={() => setEditingAgentId(null)}
+            providers={data.providers}
             onSubmit={async (updates) => {
               const updated = await updateAgent(editingAgentId, updates);
               setEditingAgentId(null);
@@ -1182,259 +1113,6 @@ export default function App() {
         )}
       </div>
     </AvatarStyleContext.Provider>
-  );
-}
-
-function Onboarding({
-  onDone,
-  providers,
-  device,
-}: {
-  onDone: () => void;
-  providers: Provider[];
-  device: Device;
-}) {
-  const [step, setStep] = useState(0);
-  const [copied, setCopied] = useState(false);
-  const [platform, setPlatform] = useState<"unix" | "windows">(() =>
-    navigator.userAgent.toLowerCase().includes("windows") ? "windows" : "unix",
-  );
-  const subscriptionAvailable = providers.some(
-    (provider) =>
-      provider.id === "claude-sub" && provider.status === "available",
-  );
-  const [providerMode, setProviderMode] = useState<"subscription" | "api">(
-    subscriptionAvailable ? "subscription" : "api",
-  );
-  const [apiProvider, setApiProvider] = useState("OpenAI");
-  const [apiKey, setApiKey] = useState("");
-  const [connecting, setConnecting] = useState(false);
-  const installCommand =
-    platform === "windows"
-      ? "irm https://opencrew.xyz/install.ps1 | iex"
-      : "curl -fsSL https://opencrew.xyz/install.sh | sh";
-  const steps = ["Welcome", "Connect", "Provider"];
-  return (
-    <div className="onboarding">
-      <header>
-        <div className="brand">
-          <BrandMark />
-          <span>OpenCrew</span>
-        </div>
-        <button className="text-button" onClick={onDone}>
-          Open demo
-        </button>
-      </header>
-      <div className="onboarding-body">
-        <div className="stepper">
-          {steps.map((label, index) => (
-            <div key={label} className={index <= step ? "complete" : ""}>
-              <span>{index < step ? <Check size={13} /> : index + 1}</span>
-              <em>{label}</em>
-            </div>
-          ))}
-        </div>
-        {step === 0 && (
-          <div className="onboarding-card hero-card">
-            <div className="eyebrow">Your crew is waiting</div>
-            <h1>
-              Bring your best agents
-              <br />
-              into one conversation.
-            </h1>
-            <p>
-              OpenCrew connects models and coding agents you already use. Your
-              local credentials stay on your device.
-            </p>
-            <div className="feature-row">
-              <span>
-                <MessageCircle size={17} /> Natural conversations
-              </span>
-              <span>
-                <LockKeyhole size={17} /> Local credentials
-              </span>
-              <span>
-                <Zap size={17} /> Live runtime activity
-              </span>
-            </div>
-            <button className="primary-button" onClick={() => setStep(1)}>
-              Set up OpenCrew <ChevronRight size={17} />
-            </button>
-          </div>
-        )}
-        {step === 1 && (
-          <div className="onboarding-card">
-            <div className="mini-icon">
-              <Laptop size={22} />
-            </div>
-            <h2>Connect this computer</h2>
-            <p>
-              Install the local bridge to use Claude Code, Codex, and your
-              workspaces securely.
-            </p>
-            <div className="os-switch" aria-label="Operating system">
-              <button
-                className={platform === "unix" ? "active" : ""}
-                onClick={() => setPlatform("unix")}
-              >
-                macOS / Linux
-              </button>
-              <button
-                className={platform === "windows" ? "active" : ""}
-                onClick={() => setPlatform("windows")}
-              >
-                Windows
-              </button>
-            </div>
-            <div className="command">
-              <code>{installCommand}</code>
-              <button
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(installCommand);
-                    setCopied(true);
-                    window.setTimeout(() => setCopied(false), 1800);
-                  } catch {
-                    setCopied(false);
-                  }
-                }}
-              >
-                <span>{copied ? "Copied" : "Copy"}</span>
-                {copied ? <Check size={15} /> : null}
-              </button>
-            </div>
-            <div className="detected">
-              <span className="pulse" />
-              <div>
-                <strong>{device.name}</strong>
-                <small>{device.platform} · agentd connected</small>
-              </div>
-              <Check size={17} />
-            </div>
-            <div className="onboarding-actions">
-              <button className="secondary-button" onClick={() => setStep(0)}>
-                Back
-              </button>
-              <button className="primary-button" onClick={() => setStep(2)}>
-                Continue <ChevronRight size={17} />
-              </button>
-            </div>
-          </div>
-        )}
-        {step === 2 && (
-          <div className="onboarding-card">
-            <div className="mini-icon">
-              <Cpu size={22} />
-            </div>
-            <h2>Choose a model provider</h2>
-            <p>
-              {subscriptionAvailable
-                ? "We found a provider that can be used without entering an API key."
-                : "Connect a provider to choose the models your agents can use."}
-            </p>
-            {subscriptionAvailable && (
-              <button
-                className={`provider-choice ${providerMode === "subscription" ? "selected" : "muted"}`}
-                onClick={() => setProviderMode("subscription")}
-              >
-                <ProviderLogo provider="Claude Subscription" />
-                <div>
-                  <strong>Claude Subscription</strong>
-                  <small>
-                    Claude Code detected · Logged in · Subscription available
-                  </small>
-                </div>
-                <span>
-                  {providerMode === "subscription" && <Check size={14} />}
-                </span>
-              </button>
-            )}
-            <button
-              className={`provider-choice ${providerMode === "api" ? "selected" : "muted"}`}
-              onClick={() => setProviderMode("api")}
-            >
-              <div className="provider-logo outline" aria-hidden="true">
-                <Plus size={17} />
-              </div>
-              <div>
-                <strong>Use an API provider</strong>
-                <small>OpenAI, Anthropic, OpenRouter, Gemini, and more</small>
-              </div>
-              {providerMode === "api" ? (
-                <span>
-                  <Check size={14} />
-                </span>
-              ) : (
-                <ChevronRight size={17} />
-              )}
-            </button>
-            {providerMode === "api" && (
-              <div className="provider-fields">
-                <label>
-                  Provider
-                  <select
-                    value={apiProvider}
-                    onChange={(event) => setApiProvider(event.target.value)}
-                  >
-                    {[
-                      "OpenAI",
-                      "Anthropic API",
-                      "OpenRouter",
-                      "Gemini",
-                      "DeepSeek",
-                      "OpenAI-compatible",
-                    ].map((provider) => (
-                      <option key={provider}>{provider}</option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  API key
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    placeholder="Paste key securely"
-                  />
-                </label>
-              </div>
-            )}
-            <div className="security-note">
-              <ShieldCheck size={16} />
-              <span>
-                {providerMode === "subscription"
-                  ? "Subscription credentials stay local and are never shared with the server."
-                  : "The key is sent directly to agentd for encrypted local storage and immediate testing."}
-              </span>
-            </div>
-            <div className="onboarding-actions">
-              <button className="secondary-button" onClick={() => setStep(1)}>
-                Back
-              </button>
-              <button
-                className="primary-button"
-                disabled={
-                  connecting || (providerMode === "api" && !apiKey.trim())
-                }
-                onClick={() => {
-                  setConnecting(true);
-                  window.setTimeout(onDone, 450);
-                }}
-              >
-                {connecting
-                  ? "Testing connection…"
-                  : providerMode === "subscription"
-                    ? "Use Claude subscription"
-                    : `Connect ${apiProvider}`}
-                {!connecting && <Check size={17} />}
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-      <footer>Open source · Self-hostable · Your data</footer>
-    </div>
   );
 }
 
@@ -1771,6 +1449,7 @@ function SettingsPanel({
   theme,
   onThemeChange,
   onNotify,
+  onProvidersChanged,
   onClose,
 }: {
   providers: Provider[];
@@ -1781,6 +1460,7 @@ function SettingsPanel({
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
   onNotify: (message: string) => void;
+  onProvidersChanged: () => void;
   onClose: () => void;
 }) {
   const [section, setSection] = useState<
@@ -1856,7 +1536,7 @@ function SettingsPanel({
             ))}
             <div className="local-note">
               <LockKeyhole size={15} />
-              <span>Local provider credentials never leave agentd.</span>
+              <span>Provider credentials are stored on the OpenCrew server.</span>
             </div>
           </>
         ) : section === "devices" ? (
@@ -1979,15 +1659,10 @@ function SettingsPanel({
           </>
         )}
       </div>
-      {addingProvider && (
-        <ProviderSetup
-          onClose={() => setAddingProvider(false)}
-          onConnected={(name) => {
-            setAddingProvider(false);
-            onNotify(`${name} connected and tested.`);
-          }}
-        />
-      )}
+      <button className="secondary-button" onClick={() => void gateway.logout()}>Log out</button>
+      {addingProvider && <ProviderConnect onClose={() => setAddingProvider(false)} onConnected={() => {
+        setAddingProvider(false); onProvidersChanged(); onNotify('Provider saved.');
+      }} />}
     </aside>
   );
 }
@@ -2220,137 +1895,6 @@ function SearchDialog({
   );
 }
 
-function ProviderSetup({
-  onClose,
-  onConnected,
-}: {
-  onClose: () => void;
-  onConnected: (name: string) => void;
-}) {
-  const choices = [
-    "Claude Subscription",
-    "Anthropic API",
-    "OpenAI",
-    "OpenRouter",
-    "Gemini",
-    "DeepSeek",
-    "Ollama",
-    "OpenAI-compatible",
-  ];
-  const dialogRef = useDialog(onClose);
-  const [provider, setProvider] = useState("Claude Subscription");
-  const [key, setKey] = useState("");
-  const [testing, setTesting] = useState(false);
-  const needsKey = !["Claude Subscription", "Ollama"].includes(provider);
-  return (
-    <div
-      className="modal-layer"
-      onMouseDown={(event) => event.currentTarget === event.target && onClose()}
-    >
-      <div
-        ref={dialogRef}
-        className="modal provider-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Add provider"
-      >
-        <header>
-          <div>
-            <span className="eyebrow">Model provider</span>
-            <h2>Add a provider</h2>
-            <p>Credentials are stored and tested by agentd on your device.</p>
-          </div>
-          <button
-            className="icon-button"
-            onClick={onClose}
-            aria-label="Close provider setup"
-          >
-            <X size={18} />
-          </button>
-        </header>
-        <div className="form">
-          <label>
-            Provider
-            <select
-              value={provider}
-              onChange={(event) => {
-                setProvider(event.target.value);
-                setKey("");
-              }}
-            >
-              {choices.map((choice) => (
-                <option key={choice}>{choice}</option>
-              ))}
-            </select>
-          </label>
-          {provider === "Claude Subscription" ? (
-            <div className="detected compact">
-              <span className="pulse" />
-              <div>
-                <strong>Claude Code detected</strong>
-                <small>Logged in · Subscription available</small>
-              </div>
-              <Check size={17} />
-            </div>
-          ) : provider === "Ollama" ? (
-            <div className="detected compact">
-              <span className="pulse" />
-              <div>
-                <strong>Ollama detected</strong>
-                <small>Local · 127.0.0.1:11434</small>
-              </div>
-              <Check size={17} />
-            </div>
-          ) : (
-            <label>
-              API key
-              <input
-                autoFocus
-                type="password"
-                autoComplete="off"
-                value={key}
-                onChange={(event) => setKey(event.target.value)}
-                placeholder="Paste key securely"
-              />
-              <small className="field-help">
-                <LockKeyhole size={12} /> Never sent to the OpenCrew server
-              </small>
-            </label>
-          )}
-          <div className="security-note">
-            <ShieldCheck size={16} />
-            <span>
-              {needsKey
-                ? "The credential is encrypted locally and tested directly with the provider."
-                : "OpenCrew will use your existing local authentication."}
-            </span>
-          </div>
-        </div>
-        <footer>
-          <button className="secondary-button" onClick={onClose}>
-            Cancel
-          </button>
-          <button
-            className="primary-button"
-            disabled={(needsKey && !key.trim()) || testing}
-            onClick={() => {
-              setTesting(true);
-              window.setTimeout(() => onConnected(provider), 550);
-            }}
-          >
-            {testing
-              ? "Testing…"
-              : needsKey
-                ? "Save and test"
-                : `Use ${provider}`}{" "}
-            {!testing && <Check size={16} />}
-          </button>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
 function AgentProfileDialog({
   agent,
   onClose,
@@ -2420,11 +1964,13 @@ function AgentProfileDialog({
 }
 
 function AgentEditor({
+  providers,
   agent,
   onClose,
   onSubmit,
 }: {
   agent?: Agent;
+  providers: Provider[];
   onClose: () => void;
   onSubmit: (agent: CreateAgentInput) => Promise<void>;
 }) {
@@ -2434,7 +1980,8 @@ function AgentEditor({
   const [advanced, setAdvanced] = useState(
     Boolean(agent?.workspace || agent?.instructions),
   );
-  const [model, setModel] = useState(agent?.model ?? "Auto");
+  const [model, setModel] = useState(agent?.model ?? "");
+  const [providerId, setProviderId] = useState(agent?.providerId ?? providers[0]?.id ?? "");
   const [runtime, setRuntime] = useState(agent?.runtime ?? "Chat");
   const [workspace, setWorkspace] = useState(agent?.workspace ?? "");
   const [instructions, setInstructions] = useState(agent?.instructions ?? "");
@@ -2445,9 +1992,9 @@ function AgentEditor({
   const [error, setError] = useState("");
   const editing = Boolean(agent);
   const templates = [
-    ["Product", "Product strategist", "Claude Sonnet 4", "Chat", "Turn ambiguous ideas into concise plans, tradeoffs, and next steps."],
-    ["Engineering", "Staff engineer", "Auto", "Codex", "Work carefully in the repository, explain important decisions, and verify changes."],
-    ["Research", "Research partner", "GPT-5", "Chat", "Find reliable evidence, distinguish facts from inference, and cite primary sources."],
+    ["Product", "Product strategist", "Turn ambiguous ideas into concise plans, tradeoffs, and next steps."],
+    ["Engineering", "Staff engineer", "Work carefully, explain important decisions, and verify changes."],
+    ["Research", "Research partner", "Find reliable evidence and distinguish facts from inference."],
   ] as const;
   const previewAgent: Agent = {
     id: agent?.id ?? "agent-preview",
@@ -2457,6 +2004,7 @@ function AgentEditor({
     color: agent?.color ?? "#7857d8",
     status: agent?.status ?? "online",
     model,
+    providerId,
     runtime,
     workspace: workspace || undefined,
     memory: agent?.memory ?? [],
@@ -2466,21 +2014,22 @@ function AgentEditor({
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!name.trim() || !role.trim() || saving) return;
+    if (!name.trim() || !role.trim() || !model.trim() || !providerId || saving) return;
     setSaving(true);
     setError("");
     try {
       await onSubmit({
         name: name.trim(),
         role: role.trim(),
-        model,
+        model: model.trim(),
+        providerId,
         runtime,
         memoryEnabled,
         workspace: runtime === "Chat" ? undefined : workspace || undefined,
         instructions: instructions.trim() || undefined,
       });
     } catch {
-      setError(`The agent could not be ${editing ? "updated" : "created"}. Please try again.`);
+      setError(`The agent could not be ${editing ? "updated" : "created"}. Check the provider and model ID.`);
       setSaving(false);
     }
   }
@@ -2525,14 +2074,12 @@ function AgentEditor({
             <div className="template-picker">
               <span>Start with a role</span>
               <div>
-                {templates.map(([label, templateRole, templateModel, templateRuntime, templateInstructions]) => (
+                {templates.map(([label, templateRole, templateInstructions]) => (
                   <button
                     type="button"
                     key={label}
                     onClick={() => {
                       setRole(templateRole);
-                      setModel(templateModel);
-                      setRuntime(templateRuntime);
                       setInstructions(templateInstructions);
                     }}
                   >
@@ -2567,41 +2114,11 @@ function AgentEditor({
           </label>
           <div className="form-section-label">How this agent works</div>
           <div className="simple-options">
-            <label>
-              Model
-              <select
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-              >
-                <option>Auto</option>
-                <option>Claude Sonnet 4</option>
-                <option>GPT-5</option>
-                <option>Gemini 2.5 Pro</option>
-              </select>
-            </label>
-            <label>
-              Runtime
-              <select
-                value={runtime}
-                onChange={(event) => setRuntime(event.target.value)}
-              >
-                <option>Chat</option>
-                <option>Claude Code</option>
-                <option>Codex</option>
-              </select>
-            </label>
+            <label>Provider<select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
+              {providers.filter((p) => p.status === 'connected').map((p) => <option key={p.id} value={p.id}>{p.name} ({p.id})</option>)}
+            </select></label>
+            <label>Model ID<input required value={model} onChange={(event) => setModel(event.target.value)} placeholder="e.g. gpt-4o-mini or claude-sonnet-4-20250514" /></label>
           </div>
-          <label className="memory-toggle">
-            <span>
-              Memory<strong>Keep useful context across conversations</strong>
-            </span>
-            <input
-              type="checkbox"
-              checked={memoryEnabled}
-              onChange={(event) => setMemoryEnabled(event.target.checked)}
-            />
-            <i />
-          </label>
           <button
             type="button"
             className="advanced-toggle"
@@ -2613,22 +2130,6 @@ function AgentEditor({
           </button>
           {advanced && (
             <div className="advanced-options">
-              <label>
-                Workspace
-                <select
-                  disabled={runtime === "Chat"}
-                  value={workspace}
-                  onChange={(event) => setWorkspace(event.target.value)}
-                >
-                  <option value="">No workspace</option>
-                  <option value="opencrew.dev">opencrew.dev</option>
-                </select>
-                <small className="field-description">
-                  {runtime === "Chat"
-                    ? "Choose a coding runtime to attach a workspace."
-                    : "The folder this agent can work in."}
-                </small>
-              </label>
               <label>
                 Working instructions
                 <textarea

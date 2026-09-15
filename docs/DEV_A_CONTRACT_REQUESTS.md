@@ -1,47 +1,18 @@
-# Developer A contract requests
+# P0 API contract implemented
 
-Repository: protocol / server / sdk
+The SDK is the app's canonical client. Server resources use `/api/v1` only; WebSocket events are at `/api/v1/ws?token=...&sinceSeq=...`.
 
-## Client resources
+| Flow | Resource |
+| --- | --- |
+| Initial state | `GET /api/v1/auth/status` |
+| First admin / login / logout / current user | `POST /api/v1/auth/setup`, `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me` |
+| Remote provider config | `GET/POST /api/v1/providers` |
+| Agent list / create / edit | `GET/POST /api/v1/agents`, `PATCH /api/v1/agents/{id}` |
+| DM list / create | `GET/POST /api/v1/conversations` |
+| History / send | `GET/POST /api/v1/conversations/{id}/messages` |
+| Agent memory facts | `GET/POST /api/v1/agents/{id}/memory-facts` |
+| Realtime | `message.created` with persistent sequence replay; `agent.run.failed` on provider invocation error |
 
-Required:
+A DM user message automatically invokes the DM agent's `modelPolicy.defaultProviderId` and `defaultModel`. Agent personality, provider ID, and model ID are persisted on the server. Runtime binding and runtime sessions remain separate resources; the P0 chat agent editor does not assign them.
 
-```text
-GET/POST/PATCH /api/v1/agents
-GET/POST       /api/v1/conversations
-GET/POST       /api/v1/conversations/{id}/messages
-GET/PATCH      /api/v1/agents/{id}/memory
-GET            /api/v1/providers
-GET            /api/v1/runtimes
-GET            /api/v1/devices
-GET            /api/v1/workspaces
-GET            /api/v1/approvals
-POST           /api/v1/approvals/{id}/decisions
-```
-
-Agent create/update needs distinct `model`, `providerId`, `runtimeId`, and optional `workspaceId` fields. Messages need `replyToMessageId` and structured mentions (`entityType`, `entityId`, offsets) rather than relying only on parsed display text.
-
-Reason: the client implements agent creation, DMs, groups, memory, provider/runtime/workspace selectors, device status, and approval decisions.
-
-## Realtime stream
-
-Required events:
-
-```text
-message.created
-message.delta
-message.completed
-agent.status.changed
-runtime.activity.started
-runtime.activity.updated
-runtime.activity.completed
-runtime.approval.requested
-runtime.approval.resolved
-device.status.changed
-```
-
-Every event needs a stable event ID, entity ID, monotonic sequence within a stream, and timestamp so the PWA can reconnect and deduplicate safely.
-
-Reason: the conversation UI renders token streaming, agent presence, runtime progress, device health, and inline approvals.
-
-Current integration seam: `src/lib/gateway.ts`.
+The previous request list included device/workspace selectors, streaming deltas, runtime activity, and approvals that the server does not yet offer in the requested shape. These remain P1 and are not presented as working P0 data.
